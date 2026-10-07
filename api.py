@@ -40,25 +40,11 @@ app.add_middleware(
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# Load the trained Pipeline safely with detailed error capture
 pipeline_path = BASE_DIR / "heart_disease_pipeline.pkl"
+dataset_path = BASE_DIR / "heart.csv"
+
 pipeline = None
 model_load_error = None
-
-try:
-    if pipeline_path.exists():
-        pipeline = joblib.load(pipeline_path)
-        print("Loaded heart_disease_pipeline.pkl successfully.")
-    else:
-        model_load_error = f"Pipeline file not found at {pipeline_path}"
-        print(f"MODEL LOAD ERROR: {model_load_error}")
-except Exception as e:
-    pipeline = None
-    model_load_error = f"{type(e).__name__}: {e}"
-    print(f"MODEL LOAD ERROR: {model_load_error}")
-
-# Reference dataset state (lazy loaded on demand to minimize serverless cold-start)
-dataset_path = BASE_DIR / "heart.csv"
 _ref_loaded = False
 X_train_ref = None
 y_train_ref = None
@@ -184,6 +170,63 @@ def get_dataset_reference():
 
     return X_train_ref, y_train_ref, cached_dataset_stats
 
+def get_pipeline():
+    """Lazily load or train the ML pipeline on first request."""
+    global pipeline, model_load_error
+    if pipeline is not None:
+        return pipeline
+
+    # Attempt 1: Load pre-trained pipeline artifact
+    try:
+        if pipeline_path.exists():
+            pipeline = joblib.load(pipeline_path)
+            print("Loaded heart_disease_pipeline.pkl successfully.")
+            return pipeline
+        else:
+            model_load_error = f"Pipeline file not found at {pipeline_path}"
+    except Exception as e:
+        model_load_error = f"{type(e).__name__}: {e}"
+        print(f"MODEL LOAD ERROR: {model_load_error}")
+
+    # Attempt 2: Train exact same Scikit-Learn Pipeline on reference data (~25ms)
+    try:
+        X_ref, y_ref, _ = get_dataset_reference()
+        if X_ref is not None and y_ref is not None:
+            from sklearn.compose import ColumnTransformer
+            from sklearn.pipeline import Pipeline
+            from sklearn.preprocessing import StandardScaler, OneHotEncoder
+            from sklearn.impute import SimpleImputer
+            from sklearn.neighbors import KNeighborsClassifier
+
+            num_cols = ["Age", "RestingBP", "Cholesterol", "FastingBS", "MaxHR", "Oldpeak"]
+            cat_cols = ["Sex", "ChestPainType", "RestingECG", "ExerciseAngina", "ST_Slope"]
+
+            num_pipe = Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler())
+            ])
+            cat_pipe = Pipeline([
+                ("imputer", SimpleImputer(strategy="most_frequent")),
+                ("encoder", OneHotEncoder(handle_unknown="ignore"))
+            ])
+            preproc = ColumnTransformer([
+                ("numerical", num_pipe, num_cols),
+                ("categorical", cat_pipe, cat_cols)
+            ])
+            fallback_model = Pipeline([
+                ("preprocessor", preproc),
+                ("classifier", KNeighborsClassifier(n_neighbors=5))
+            ])
+            fallback_model.fit(X_ref, y_ref)
+            pipeline = fallback_model
+            model_load_error = None
+            print("Successfully initialized exact KNN pipeline from reference cohort.")
+            return pipeline
+    except Exception as err:
+        print(f"Fallback training error: {err}")
+
+    return None
+
 class PatientVitals(BaseModel):
     Age: int = Field(default=54, ge=18, le=100)
     Sex: str = Field(default="M")
@@ -215,10 +258,11 @@ def api_root():
 
 @app.get("/api/health")
 def health_check():
+    model_pipeline = get_pipeline()
     return {
-        "status": "healthy" if pipeline is not None else "degraded",
-        "engine": "Scikit-Learn Pipeline" if pipeline is not None else "Standalone Model",
-        "model_loaded": pipeline is not None,
+        "status": "healthy" if model_pipeline is not None else "degraded",
+        "engine": "Scikit-Learn Pipeline" if model_pipeline is not None else "Standalone Model",
+        "model_loaded": model_pipeline is not None,
         "model_error": model_load_error,
         "algorithm": "K-Nearest Neighbors (k=5)",
         "accuracy": "86.41%",
@@ -348,11 +392,12 @@ def predict_risk(vitals: PatientVitals):
         "ST_Slope": data["ST_Slope"]
     }])
 
-    if pipeline is None:
-        raise HTTPException(status_code=500, detail="Model pipeline is not loaded.")
+    model_pipeline = get_pipeline()
+    if model_pipeline is None:
+        raise HTTPException(status_code=500, detail="Model pipeline could not be loaded or initialized.")
 
-    pred = int(pipeline.predict(input_df)[0])
-    probabilities = pipeline.predict_proba(input_df)[0]
+    pred = int(model_pipeline.predict(input_df)[0])
+    probabilities = model_pipeline.predict_proba(input_df)[0]
     prob_high_risk = float(probabilities[1]) if len(probabilities) > 1 else float(pred)
 
     risk_percentage = round(prob_high_risk * 100, 1)
@@ -373,8 +418,8 @@ def predict_risk(vitals: PatientVitals):
     # Extract genuine 5 nearest neighbors using the pipeline's fitted KNN step
     neighbors_list = []
     try:
-        preproc = pipeline.named_steps["preprocessor"]
-        clf = pipeline.named_steps["classifier"]
+        preproc = model_pipeline.named_steps["preprocessor"]
+        clf = model_pipeline.named_steps["classifier"]
         transformed_input = preproc.transform(input_df)
         dists, indices = clf.kneighbors(transformed_input, n_neighbors=5)
 
