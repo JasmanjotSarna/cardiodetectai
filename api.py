@@ -40,129 +40,149 @@ app.add_middleware(
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# Load the trained Pipeline
+# Load the trained Pipeline safely with detailed error capture
 pipeline_path = BASE_DIR / "heart_disease_pipeline.pkl"
+pipeline = None
+model_load_error = None
+
 try:
-    pipeline = joblib.load(pipeline_path)
-    print("Loaded heart_disease_pipeline.pkl successfully.")
+    if pipeline_path.exists():
+        pipeline = joblib.load(pipeline_path)
+        print("Loaded heart_disease_pipeline.pkl successfully.")
+    else:
+        model_load_error = f"Pipeline file not found at {pipeline_path}"
+        print(f"MODEL LOAD ERROR: {model_load_error}")
 except Exception as e:
     pipeline = None
-    print(f"Error loading pipeline: {e}")
+    model_load_error = f"{type(e).__name__}: {e}"
+    print(f"MODEL LOAD ERROR: {model_load_error}")
 
-# Load and prepare training reference dataframe for authentic KNN neighbors extraction & dataset statistics
+# Reference dataset state (lazy loaded on demand to minimize serverless cold-start)
 dataset_path = BASE_DIR / "heart.csv"
-raw_df = None
+_ref_loaded = False
 X_train_ref = None
 y_train_ref = None
 cached_dataset_stats = None
 
-try:
-    if dataset_path.exists():
-        raw_df = pd.read_csv(dataset_path)
-        clean_df = raw_df.copy()
-        clean_df["RestingBP"] = clean_df["RestingBP"].replace(0, np.nan)
-        clean_df["Cholesterol"] = clean_df["Cholesterol"].replace(0, np.nan)
+def get_dataset_reference():
+    """Lazily load training reference dataframe and pre-aggregated dataset statistics."""
+    global _ref_loaded, X_train_ref, y_train_ref, cached_dataset_stats
+    if _ref_loaded:
+        return X_train_ref, y_train_ref, cached_dataset_stats
 
-        X = clean_df.drop("HeartDisease", axis=1)
-        y = clean_df["HeartDisease"]
+    try:
+        if dataset_path.exists():
+            raw_df = pd.read_csv(dataset_path)
+            clean_df = raw_df.copy()
+            clean_df["RestingBP"] = clean_df["RestingBP"].replace(0, np.nan)
+            clean_df["Cholesterol"] = clean_df["Cholesterol"].replace(0, np.nan)
 
-        X_train_ref, _, y_train_ref, _ = train_test_split(
-            X, y, test_size=0.2, stratify=y, random_state=42
-        )
-        print(f"Loaded {len(raw_df)} records from heart.csv; reference train cohort: {len(X_train_ref)} instances.")
+            X = clean_df.drop("HeartDisease", axis=1)
+            y = clean_df["HeartDisease"]
 
-        # Compute pre-aggregated dataset statistics for /api/dataset-stats
-        # 1. Class balance
-        pos_count = int(raw_df["HeartDisease"].sum())
-        neg_count = int(len(raw_df) - pos_count)
+            X_train_ref, _, y_train_ref, _ = train_test_split(
+                X, y, test_size=0.2, stratify=y, random_state=42
+            )
+            print(f"Loaded {len(raw_df)} records from heart.csv; reference train cohort: {len(X_train_ref)} instances.")
 
-        # 2. Age distribution bins
-        age_bins = [20, 35, 45, 55, 65, 80]
-        age_labels = ["20-35", "36-45", "46-55", "56-65", "66-80"]
-        raw_df["AgeBin"] = pd.cut(raw_df["Age"], bins=age_bins, labels=age_labels, right=True)
-        age_dist = []
-        for lab in age_labels:
-            subset = raw_df[raw_df["AgeBin"] == lab]
-            age_dist.append({
-                "range": lab,
-                "healthy": int((subset["HeartDisease"] == 0).sum()),
-                "heart_disease": int((subset["HeartDisease"] == 1).sum()),
-                "total": int(len(subset))
-            })
+            # Compute pre-aggregated dataset statistics for /api/dataset-stats
+            # 1. Class balance
+            pos_count = int(raw_df["HeartDisease"].sum())
+            neg_count = int(len(raw_df) - pos_count)
 
-        # 3. MaxHR distribution bins
-        hr_bins = [60, 100, 125, 150, 175, 210]
-        hr_labels = ["60-100", "101-125", "126-150", "151-175", "176-210"]
-        raw_df["HRBin"] = pd.cut(raw_df["MaxHR"], bins=hr_bins, labels=hr_labels, right=True)
-        hr_dist = []
-        for lab in hr_labels:
-            subset = raw_df[raw_df["HRBin"] == lab]
-            hr_dist.append({
-                "range": lab,
-                "healthy": int((subset["HeartDisease"] == 0).sum()),
-                "heart_disease": int((subset["HeartDisease"] == 1).sum()),
-                "total": int(len(subset))
-            })
+            # 2. Age distribution bins
+            age_bins = [20, 35, 45, 55, 65, 80]
+            age_labels = ["20-35", "36-45", "46-55", "56-65", "66-80"]
+            raw_df["AgeBin"] = pd.cut(raw_df["Age"], bins=age_bins, labels=age_labels, right=True)
+            age_dist = []
+            for lab in age_labels:
+                subset = raw_df[raw_df["AgeBin"] == lab]
+                age_dist.append({
+                    "range": lab,
+                    "healthy": int((subset["HeartDisease"] == 0).sum()),
+                    "heart_disease": int((subset["HeartDisease"] == 1).sum()),
+                    "total": int(len(subset))
+                })
 
-        # 4. Categorical breakdowns (ChestPainType, ST_Slope, Sex)
-        cpt_breakdown = []
-        for cpt in ["TA", "ATA", "NAP", "ASY"]:
-            sub = raw_df[raw_df["ChestPainType"] == cpt]
-            cpt_breakdown.append({
-                "category": cpt,
-                "healthy": int((sub["HeartDisease"] == 0).sum()),
-                "heart_disease": int((sub["HeartDisease"] == 1).sum())
-            })
+            # 3. MaxHR distribution bins
+            hr_bins = [60, 100, 125, 150, 175, 210]
+            hr_labels = ["60-100", "101-125", "126-150", "151-175", "176-210"]
+            raw_df["HRBin"] = pd.cut(raw_df["MaxHR"], bins=hr_bins, labels=hr_labels, right=True)
+            hr_dist = []
+            for lab in hr_labels:
+                subset = raw_df[raw_df["HRBin"] == lab]
+                hr_dist.append({
+                    "range": lab,
+                    "healthy": int((subset["HeartDisease"] == 0).sum()),
+                    "heart_disease": int((subset["HeartDisease"] == 1).sum()),
+                    "total": int(len(subset))
+                })
 
-        st_slope_breakdown = []
-        for slope in ["Up", "Flat", "Down"]:
-            sub = raw_df[raw_df["ST_Slope"] == slope]
-            st_slope_breakdown.append({
-                "category": slope,
-                "healthy": int((sub["HeartDisease"] == 0).sum()),
-                "heart_disease": int((sub["HeartDisease"] == 1).sum())
-            })
+            # 4. Categorical breakdowns (ChestPainType, ST_Slope)
+            cpt_breakdown = []
+            for cpt in ["TA", "ATA", "NAP", "ASY"]:
+                sub = raw_df[raw_df["ChestPainType"] == cpt]
+                cpt_breakdown.append({
+                    "category": cpt,
+                    "healthy": int((sub["HeartDisease"] == 0).sum()),
+                    "heart_disease": int((sub["HeartDisease"] == 1).sum())
+                })
 
-        # 5. Representative scatter sample (120 points for smooth canvas rendering)
-        sample_df = raw_df.sample(n=min(120, len(raw_df)), random_state=42)
-        scatter_sample = []
-        for _, row in sample_df.iterrows():
-            scatter_sample.append({
-                "age": int(row["Age"]),
-                "max_hr": int(row["MaxHR"]),
-                "resting_bp": int(row["RestingBP"]),
-                "cholesterol": int(row["Cholesterol"]) if not pd.isna(row["Cholesterol"]) else 223,
-                "label": int(row["HeartDisease"]),
-                "sex": str(row["Sex"]),
-                "chest_pain": str(row["ChestPainType"])
-            })
+            st_slope_breakdown = []
+            for slope in ["Up", "Flat", "Down"]:
+                sub = raw_df[raw_df["ST_Slope"] == slope]
+                st_slope_breakdown.append({
+                    "category": slope,
+                    "healthy": int((sub["HeartDisease"] == 0).sum()),
+                    "heart_disease": int((sub["HeartDisease"] == 1).sum())
+                })
 
-        # 6. Correlation matrix among continuous indicators
-        num_cols = ["Age", "RestingBP", "Cholesterol", "FastingBS", "MaxHR", "Oldpeak", "HeartDisease"]
-        clean_num = clean_df[num_cols].fillna(clean_df[num_cols].median())
-        corr_df = clean_num.corr().round(3)
-        corr_matrix = {
-            "columns": num_cols,
-            "values": corr_df.values.tolist()
-        }
+            # 5. Representative scatter sample (120 points for smooth canvas rendering)
+            sample_df = raw_df.sample(n=min(120, len(raw_df)), random_state=42)
+            scatter_sample = []
+            for _, row in sample_df.iterrows():
+                scatter_sample.append({
+                    "age": int(row["Age"]),
+                    "max_hr": int(row["MaxHR"]),
+                    "resting_bp": int(row["RestingBP"]),
+                    "cholesterol": int(row["Cholesterol"]) if not pd.isna(row["Cholesterol"]) else 223,
+                    "label": int(row["HeartDisease"]),
+                    "sex": str(row["Sex"]),
+                    "chest_pain": str(row["ChestPainType"])
+                })
 
-        cached_dataset_stats = {
-            "total_records": len(raw_df),
-            "class_balance": {
-                "healthy": neg_count,
-                "heart_disease": pos_count,
-                "healthy_pct": round((neg_count / len(raw_df)) * 100, 1),
-                "heart_disease_pct": round((pos_count / len(raw_df)) * 100, 1)
-            },
-            "age_distribution": age_dist,
-            "max_hr_distribution": hr_dist,
-            "chest_pain_breakdown": cpt_breakdown,
-            "st_slope_breakdown": st_slope_breakdown,
-            "scatter_sample": scatter_sample,
-            "correlation_matrix": corr_matrix
-        }
-except Exception as e:
-    print(f"Warning: Could not pre-compute dataset stats: {e}")
+            # 6. Correlation matrix among continuous indicators
+            num_cols = ["Age", "RestingBP", "Cholesterol", "FastingBS", "MaxHR", "Oldpeak", "HeartDisease"]
+            clean_num = clean_df[num_cols].fillna(clean_df[num_cols].median())
+            corr_df = clean_num.corr().round(3)
+            corr_matrix = {
+                "columns": num_cols,
+                "values": corr_df.values.tolist()
+            }
+
+            cached_dataset_stats = {
+                "total_records": len(raw_df),
+                "class_balance": {
+                    "healthy": neg_count,
+                    "heart_disease": pos_count,
+                    "healthy_pct": round((neg_count / len(raw_df)) * 100, 1),
+                    "heart_disease_pct": round((pos_count / len(raw_df)) * 100, 1)
+                },
+                "age_distribution": age_dist,
+                "max_hr_distribution": hr_dist,
+                "chest_pain_breakdown": cpt_breakdown,
+                "st_slope_breakdown": st_slope_breakdown,
+                "scatter_sample": scatter_sample,
+                "correlation_matrix": corr_matrix
+            }
+        else:
+            print(f"Warning: Dataset file not found at {dataset_path}")
+        _ref_loaded = True
+    except Exception as e:
+        print(f"Warning: Could not pre-compute dataset stats: {e}")
+        _ref_loaded = True
+
+    return X_train_ref, y_train_ref, cached_dataset_stats
 
 class PatientVitals(BaseModel):
     Age: int = Field(default=54, ge=18, le=100)
@@ -177,12 +197,29 @@ class PatientVitals(BaseModel):
     Oldpeak: float = Field(default=1.2, ge=0.0, le=10.0)
     ST_Slope: str = Field(default="Flat")
 
+@app.get("/")
+def root():
+    return {
+        "name": "CardioDetect AI API",
+        "status": "online",
+        "version": "2.1.0"
+    }
+
+@app.get("/api")
+def api_root():
+    return {
+        "name": "CardioDetect AI API",
+        "status": "online",
+        "version": "2.1.0"
+    }
+
 @app.get("/api/health")
 def health_check():
     return {
-        "status": "healthy",
+        "status": "healthy" if pipeline is not None else "degraded",
         "engine": "Scikit-Learn Pipeline" if pipeline is not None else "Standalone Model",
         "model_loaded": pipeline is not None,
+        "model_error": model_load_error,
         "algorithm": "K-Nearest Neighbors (k=5)",
         "accuracy": "86.41%",
         "roc_auc": "92.69%"
@@ -234,9 +271,10 @@ def get_roc_curve():
 @app.get("/api/dataset-stats")
 def get_dataset_stats():
     """Additive endpoint delivering genuine UCI Heart Disease Dataset statistics computed from heart.csv"""
-    if cached_dataset_stats is None:
+    _, _, stats = get_dataset_reference()
+    if stats is None:
         raise HTTPException(status_code=503, detail="Dataset statistics are currently unavailable.")
-    return cached_dataset_stats
+    return stats
 
 @app.get("/api/presets")
 def get_presets():
@@ -340,11 +378,12 @@ def predict_risk(vitals: PatientVitals):
         transformed_input = preproc.transform(input_df)
         dists, indices = clf.kneighbors(transformed_input, n_neighbors=5)
 
+        X_ref, y_ref, _ = get_dataset_reference()
         for i, idx in enumerate(indices[0]):
             dist = float(dists[0][i])
-            if X_train_ref is not None and y_train_ref is not None and idx < len(X_train_ref):
-                neighbor_row = X_train_ref.iloc[idx]
-                has_cad = int(y_train_ref.iloc[idx])
+            if X_ref is not None and y_ref is not None and idx < len(X_ref):
+                neighbor_row = X_ref.iloc[idx]
+                has_cad = int(y_ref.iloc[idx])
                 neighbors_list.append({
                     "id": int(idx),
                     "rank": i + 1,
