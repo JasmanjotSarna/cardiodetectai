@@ -5,3 +5,6 @@ requires-python = ">=3.12,<3.14"
 
 [tool.vercel]
 entrypoint = "api:app"
+
+[tool.vercel.fastapi.static]
+cdn = false
